@@ -1,0 +1,7 @@
+# Kurigram is the maintained fork of Pyrogram and still imports as `pyrogram`.
+# Do NOT install it alongside the original `pyrogram` package.
+kurigram>=2.2,<2.3
+tgcrypto          # needs gcc + python3-dev to build; much faster uploads
+aiohttp
+yt-dlp[default]
+python-dotenv
