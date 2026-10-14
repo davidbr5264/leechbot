@@ -31,7 +31,7 @@ else
 fi
 BOOT_TMP=""
 # Where the bot's files come from when this script is run on its own (set this once when you publish).
-REPO="${LEECHBOT_REPO:-YOUR-USER/leechbot}"
+REPO="${LEECHBOT_REPO:-davidbr5264/leechbot}"
 REF="${LEECHBOT_REF:-main}"
 SOURCE_URL="${LEECHBOT_URL:-}"
 FORCE_DOWNLOAD=0
