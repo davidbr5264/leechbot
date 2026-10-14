@@ -1,0 +1,37 @@
+[Unit]
+Description=Telegram leech bot
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting (a crash loop is better than a bot that stays down).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=leechbot
+WorkingDirectory=/opt/leechbot
+EnvironmentFile=/opt/leechbot/.env
+Environment=PYTHONUNBUFFERED=1
+# Fewer malloc arenas: returns ~2 MB more to the OS after each job (measured).
+Environment=MALLOC_ARENA_MAX=2
+ExecStart=/opt/leechbot/venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+
+# --- memory guardrails for a <1GB box (cover yt-dlp/ffmpeg children too) ---
+MemoryHigh=450M
+MemoryMax=600M
+Nice=5
+# The bot is the LAST thing the kernel should kill; yt-dlp/ffmpeg children set themselves to
+# +500 (see bot/procs.py), so they die first. If one is OOM-killed the bot keeps running and
+# reports the failure, instead of the whole service being torn down.
+OOMScoreAdjust=-100
+OOMPolicy=continue
+# Hard cap on processes+threads: a runaway can't exhaust the machine.
+TasksMax=128
+
+# Basic hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

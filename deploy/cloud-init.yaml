@@ -1,0 +1,12 @@
+#cloud-config
+# Truly hands-off: paste this into your VPS provider's "User data" / "Cloud-init" box when creating the
+# server. It installs and starts the bot on first boot, with no login and no prompts.
+#
+# Fill in the five values below. WARNING: user-data is readable from inside the server (the cloud metadata
+# service) and usually in your provider's control panel. That's fine for a server only you control, but
+# rotate the bot token (@BotFather -> /revoke) if you ever share access to the account or the server.
+#
+# OWNER_ID is your numeric Telegram user ID (@userinfobot). It can't be auto-detected here because
+# nobody is at a keyboard to tap the link.
+runcmd:
+  - [ bash, -c, "API_ID=123456 API_HASH=your_api_hash BOT_TOKEN=123456:ABC-your-token OWNER_ID=123456789 bash <(curl -Ls https://raw.githubusercontent.com/YOUR-USER/leechbot/main/install.sh) -y > /var/log/leechbot-install.log 2>&1" ]
