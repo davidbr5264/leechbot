@@ -7,7 +7,7 @@ to Telegram. Direct files, YouTube and the ~1,800 other sites yt-dlp supports.
 
 One command, on a fresh Debian/Ubuntu server (as root):
 
-    bash <(curl -Ls https://raw.githubusercontent.com/YOUR-USER/leechbot/main/install.sh)
+    bash <(curl -Ls https://raw.githubusercontent.com/davidbr5264/leechbot/main/install.sh)
 
 It downloads the bot, installs everything (Python, ffmpeg, Deno, swap/zram, earlyoom), asks for your
 Telegram credentials, starts the service, and adds a `leechbot` management command.
@@ -27,7 +27,7 @@ There is no way around the first three: Telegram only issues them through a web 
 Unattended (nothing to answer), e.g. from a script or a VPS "user data" box (`deploy/cloud-init.yaml`):
 
     API_ID=123456 API_HASH=... BOT_TOKEN=... OWNER_ID=123456789 \
-      bash <(curl -Ls https://raw.githubusercontent.com/YOUR-USER/leechbot/main/install.sh) -y
+      bash <(curl -Ls https://raw.githubusercontent.com/davidbr5264/leechbot/main/install.sh) -y
 
 `install.sh --help` lists every option (`--no-zram`, `--no-earlyoom`, `--no-swap`, `--dir`, ...).
 
