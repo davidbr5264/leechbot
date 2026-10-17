@@ -31,7 +31,7 @@ else
 fi
 BOOT_TMP=""
 # Where the bot's files come from when this script is run on its own (set this once when you publish).
-REPO="${LEECHBOT_REPO:-davidbr5264/leechbot}"
+REPO="${LEECHBOT_REPO:-YOUR-USER/leechbot}"
 REF="${LEECHBOT_REF:-main}"
 SOURCE_URL="${LEECHBOT_URL:-}"
 FORCE_DOWNLOAD=0
@@ -40,6 +40,9 @@ INSTALL_DIR="/opt/leechbot"
 SVC_USER="leechbot"
 UNIT_DIR="${LEECHBOT_UNIT_DIR:-/etc/systemd/system}"
 SWAP_MB=1024
+# A fresh server is often busy with unattended-upgrades holding the apt lock: wait for it instead of failing.
+APT=(apt-get -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3)
+PIP_OPTS=(--no-cache-dir -q --default-timeout 60 --retries 5)
 DO_SWAP=1 DO_DENO=1 DO_SYSTEMD=1 DO_TOKEN_CHECK=1 DO_ZRAM=1 DO_EARLYOOM=1
 ASSUME_YES=0 UNINSTALL=0 PURGE=0
 API_ID="${API_ID:-}" API_HASH="${API_HASH:-}" BOT_TOKEN="${BOT_TOKEN:-}" OWNER_ID="${OWNER_ID:-}"
@@ -65,7 +68,7 @@ warn() { printf '    %s!%s %s\n' "$C_Y" "$C_0" "$*" >&2; }
 die()  { printf '\n%sERROR:%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
 
 LOG="$(mktemp /tmp/leechbot-install.XXXXXX.log)"
-trap 'printf "\n%sInstall failed near line %s. Details: %s%s\n" "$C_R" "$LINENO" "$LOG" "$C_0" >&2' ERR
+trap 'printf "\n%sInstall failed at line %s (command: %s).\nDetails: %s%s\n" "$C_R" "$LINENO" "$BASH_COMMAND" "$LOG" "$C_0" >&2' ERR
 
 # run CMD...: quiet, logs output, dies with the log tail on failure
 run() {
@@ -141,6 +144,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "$SWAP_MB" =~ ^[0-9]+$ ]] || die "--swap-size must be a number of MB."
 [[ "$INSTALL_DIR" == /* ]] || die "--dir must be an absolute path."
+[[ "$INSTALL_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "--dir may only contain letters, digits and . _ - /"
 case "${INSTALL_DIR%/}" in
   ""|/bin|/boot|/dev|/etc|/home|/lib*|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
     die "Refusing to use '$INSTALL_DIR' as the install dir. Pick a dedicated folder (e.g. /opt/leechbot)." ;;
@@ -204,25 +208,79 @@ do_uninstall() {
 }
 
 # ---------- configuration ------------------------------------------------------
-env_get() { [[ -f "$ENV_FILE" ]] && sed -n "s/^$1=//p" "$ENV_FILE" | tail -n1 || true; }
+# Older versions of the installer copied the example file, placeholders and all. Text placeholders
+# (your_api_hash...) can never be real. The numeric ones (123456, 123456789) could be, so they are only
+# discarded when the same file also contains those text placeholders, i.e. it is an untouched example.
+env_get() {
+  local v=""
+  if [[ -f "$ENV_FILE" ]]; then v="$(sed -n "s/^$1=//p" "$ENV_FILE" | tail -n1)"; fi
+  case "$v" in
+    your_api_hash|*your-bot-token*|*your_bot_token*) v="" ;;
+    123456|123456789) if grep -qE 'your_api_hash|your-bot-token' "$ENV_FILE" 2>/dev/null; then v=""; fi ;;
+  esac
+  printf '%s' "$v"
+}
+
+# Pasted values often carry terminal junk: bracketed-paste markers (ESC[200~ ... ESC[201~), carriage returns,
+# stray spaces or wrapping quotes. None of our values (IDs, hashes, tokens) may contain any of those.
+sanitize() {
+  local v="$1" esc=$'\e'
+  v="${v//${esc}\[200~/}"; v="${v//${esc}\[201~/}"
+  v="${v//\[200~/}"; v="${v//\[201~/}"        # some terminals drop the ESC byte but leave the rest
+  v="${v//$esc/}"
+  v="${v//[[:space:]]/}"
+  v="${v#[\"\']}"; v="${v%[\"\']}"
+  printf '%s' "$v"
+}
+
+# read_value VAR "prompt" secret: read one line into VAR. Never dies on odd terminals or EOF without saying why.
+read_value() {
+  local __var=$1 __prompt=$2 __secret=${3:-0} __line="" __rc=0
+  if (( __secret )); then
+    IFS= read -rsp "$__prompt" __line || __rc=$?
+    echo
+  else
+    IFS= read -rp "$__prompt" __line || __rc=$?
+  fi
+  (( __rc == 0 )) || die "Input ended unexpectedly (is this an interactive terminal?). Run the installer in a normal terminal, or pass the values as options (see --help)."
+  printf -v "$__var" '%s' "$__line"
+}
+
+# what a valid value looks like, for the "try again" message
+expected() {
+  case "$1" in
+    API_ID)    echo "digits only, e.g. 1234567" ;;
+    API_HASH)  echo "32 characters, 0-9 and a-f" ;;
+    BOT_TOKEN) echo "like 123456789:AAH... (from @BotFather)" ;;
+    OWNER_ID)  echo "digits only" ;;
+    *)         echo "see the hint above" ;;
+  esac
+}
 
 # ask VAR "Prompt" REGEX [secret] [hint]
 ask() {
-  local var=$1 prompt=$2 re=$3 secret=${4:-0} hint=${5:-} val="${!1:-}" flag
+  local var=$1 prompt=$2 re=$3 secret=${4:-0} hint=${5:-} val="${!1:-}" flag typed=0
   flag="--$(printf '%s' "${var//_/-}" | tr '[:upper:]' '[:lower:]')"
+  val="$(sanitize "$val")"
   if [[ -z "$val" ]]; then
     val="$(env_get "$var")"
-    [[ -n "$val" ]] && info "$var: using the existing value from $ENV_FILE"
+    if [[ -n "$val" ]]; then info "$var: using the existing value from $ENV_FILE"; fi
   fi
   while true; do
     if [[ -z "$val" ]]; then
-      (( INTERACTIVE )) || die "Missing $var (use $flag or set the $var environment variable)."
-      [[ -n "$hint" ]] && info "$hint"
-      if (( secret )); then read -rsp "    $prompt: " val; echo; else read -rp "    $prompt: " val; fi
+      (( INTERACTIVE )) || die "Missing $var. Run this in an interactive terminal (over SSH use: ssh -t host), or pass $flag / set $var."
+      if [[ -n "$hint" && $typed -eq 0 ]]; then info "$hint"; fi
+      read_value val "    $prompt: " "$secret"
+      val="$(sanitize "$val")"; typed=1
     fi
-    if [[ "$val" =~ $re ]]; then printf -v "$var" '%s' "$val"; return 0; fi
-    (( INTERACTIVE )) || die "$var has an invalid format."
-    warn "That doesn't look right, try again."
+    if [[ "$var" == API_HASH ]]; then val="${val,,}"; fi   # my.telegram.org shows it in lowercase
+    if [[ "$val" =~ $re ]]; then
+      printf -v "$var" '%s' "$val"
+      if (( secret && typed )); then info "received ${#val} characters (ends ...${val: -4})"; fi
+      return 0
+    fi
+    (( INTERACTIVE )) || die "$var has an invalid format (expected: $(expected "$var"))."
+    warn "That doesn't look right: got ${#val} characters. Expected: $(expected "$var"). Try again."
     val=""
   done
 }
@@ -263,7 +321,8 @@ collect_config() {
     info "Only your Telegram account may use the bot. Paste your numeric user ID (from @userinfobot),"
     info "or just press Enter and I'll detect it with a one-tap link at the end."
     while true; do
-      read -rp "    Your Telegram user ID (Enter = detect automatically): " OWNER_ID
+      read_value OWNER_ID "    Your Telegram user ID (Enter = detect automatically): "
+      OWNER_ID="$(sanitize "$OWNER_ID")"
       if [[ -z "$OWNER_ID" ]]; then DETECT_OWNER=1; break; fi
       [[ "$OWNER_ID" =~ $RE_ID ]] && break
       warn "That doesn't look right, try again."
@@ -303,7 +362,7 @@ fetch() {  # fetch URL DEST
 ensure_downloader() {
   if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then return 0; fi
   case "$PM" in
-    apt) export DEBIAN_FRONTEND=noninteractive; run apt-get update -qq; run apt-get install -y -qq curl ca-certificates ;;
+    apt) export DEBIAN_FRONTEND=noninteractive; run "${APT[@]}" update -qq; run "${APT[@]}" install -y -qq curl ca-certificates ;;
     dnf|yum) run "$PM" install -y -q curl ca-certificates ;;
   esac
 }
@@ -352,13 +411,20 @@ preflight() {
   fi
 }
 
+pkg_install() {  # pkg_install NAME...  (quiet; returns the exit status instead of dying)
+  case "$PM" in
+    apt) run_try "${APT[@]}" install -y -qq "$@" ;;
+    *)   run_try "$PM" install -y -q "$@" ;;
+  esac
+}
+
 install_packages() {
   step "Installing system packages (this can take a few minutes)"
   case "$PM" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
-      run apt-get update -qq
-      run apt-get install -y -qq --no-install-recommends \
+      run "${APT[@]}" update -qq
+      run "${APT[@]}" install -y -qq --no-install-recommends \
         python3 python3-venv python3-pip python3-dev gcc libc6-dev ffmpeg curl ca-certificates unzip ;;
     dnf|yum)
       run "$PM" install -y -q python3 python3-pip python3-devel gcc curl ca-certificates unzip
@@ -366,10 +432,6 @@ install_packages() {
         || warn "ffmpeg isn't in your repos (try enabling RPM Fusion/EPEL). Video merging and thumbnails need it." ;;
   esac
   ok "Packages installed"
-  local enc; enc="$(ffmpeg -hide_banner -encoders 2>/dev/null || true)"   # captured, not piped (pipefail + grep -q = false alarms)
-  if command -v ffmpeg >/dev/null 2>&1 && [[ "$enc" != *libmp3lame* ]]; then
-    warn "Your ffmpeg has no MP3 encoder (libmp3lame): MP3 audio downloads will fail."
-  fi
 
   PY="$(command -v python3)" || die "python3 not found after install."
   "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
@@ -400,7 +462,7 @@ copy_files() {
     ok "Running from $INSTALL_DIR already"
   fi
 
-  if [[ ! -f "$ENV_FILE" ]]; then cp "$INSTALL_DIR/.env.example" "$ENV_FILE"; fi
+  if [[ ! -f "$ENV_FILE" ]]; then ( umask 077; cp "$INSTALL_DIR/.env.example" "$ENV_FILE" ); fi
   local old_tok old_id old_hash
   old_tok="$(env_get BOT_TOKEN)"; old_id="$(env_get API_ID)"; old_hash="$(env_get API_HASH)"
   if [[ ( -n "$old_tok" && "$old_tok" != "$BOT_TOKEN" ) || ( -n "$old_id" && "$old_id" != "$API_ID" ) \
@@ -428,13 +490,13 @@ install_ctl() {
 setup_venv() {
   step "Python environment"
   [[ -x "$VENV/bin/python" ]] || run "$PY" -m venv "$VENV"
-  run "$VENV/bin/python" -m pip install --no-cache-dir -q --upgrade pip wheel
+  run "$VENV/bin/python" -m pip install "${PIP_OPTS[@]}" --upgrade pip wheel
   # tgcrypto compiles C code; install it separately so a build failure isn't fatal.
   local req; req="$(mktemp)"
   grep -v -i -E '^[[:space:]]*(tgcrypto|#|$)' "$INSTALL_DIR/requirements.txt" | sed 's/[[:space:]]*#.*//' > "$req"
-  run "$VENV/bin/python" -m pip install --no-cache-dir -q -r "$req"
+  run "$VENV/bin/python" -m pip install "${PIP_OPTS[@]}" -r "$req"
   rm -f "$req"
-  if run_try "$VENV/bin/python" -m pip install --no-cache-dir -q tgcrypto; then
+  if run_try "$VENV/bin/python" -m pip install "${PIP_OPTS[@]}" tgcrypto; then
     ok "Dependencies installed (with TgCrypto for fast uploads)"
   else
     warn "TgCrypto failed to build; uploads will work but slower."
@@ -518,7 +580,7 @@ setup_zram() {
     warn "This kernel has no zram module (typical for containers/OpenVZ); skipping. Disk swap still protects you."
     return 0
   fi
-  if ! run_try apt-get install -y -qq --no-install-recommends zram-tools; then warn "Couldn't install zram-tools; skipping."; return 0; fi
+  if ! run_try "${APT[@]}" install -y -qq --no-install-recommends zram-tools; then warn "Couldn't install zram-tools; skipping."; return 0; fi
 
   local algo=lzo a
   for a in zstd lz4; do
@@ -544,7 +606,7 @@ setup_zram() {
 setup_earlyoom() {
   step "Out-of-memory protection (earlyoom)"
   if (( ! DO_EARLYOOM )); then info "Skipped (--no-earlyoom)"; return 0; fi
-  if ! run_try "$PM" install -y -q earlyoom; then
+  if ! pkg_install earlyoom; then
     warn "Couldn't install earlyoom (not in your repos?). The kernel OOM killer still works, just later."
     return 0
   fi

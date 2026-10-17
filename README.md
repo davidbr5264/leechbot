@@ -7,7 +7,7 @@ to Telegram. Direct files, YouTube and the ~1,800 other sites yt-dlp supports.
 
 One command, on a fresh Debian/Ubuntu server (as root):
 
-    bash <(curl -Ls https://raw.githubusercontent.com/davidbr5264/leechbot/main/install.sh)
+    bash <(curl -Ls https://raw.githubusercontent.com/YOUR-USER/leechbot/main/install.sh)
 
 It downloads the bot, installs everything (Python, ffmpeg, Deno, swap/zram, earlyoom), asks for your
 Telegram credentials, starts the service, and adds a `leechbot` management command.
@@ -27,7 +27,7 @@ There is no way around the first three: Telegram only issues them through a web 
 Unattended (nothing to answer), e.g. from a script or a VPS "user data" box (`deploy/cloud-init.yaml`):
 
     API_ID=123456 API_HASH=... BOT_TOKEN=... OWNER_ID=123456789 \
-      bash <(curl -Ls https://raw.githubusercontent.com/davidbr5264/leechbot/main/install.sh) -y
+      bash <(curl -Ls https://raw.githubusercontent.com/YOUR-USER/leechbot/main/install.sh) -y
 
 `install.sh --help` lists every option (`--no-zram`, `--no-earlyoom`, `--no-swap`, `--dir`, ...).
 
@@ -63,18 +63,24 @@ No commands needed.
 - **Direct file link** (`.mp4`, `.zip`, `.pdf`, ..., or any URL the server says is a file): downloaded and
   uploaded straight away. Add `| new_name.ext` after the link to rename it. Files over ~2 GB are split
   into `.001`, `.002`... parts (rejoin with `cat name.* > name`).
-- **YouTube / video-site link**: the bot asks yt-dlp what the link *really* offers and shows buttons for
-  exactly those resolutions, with estimated sizes, plus **MP3**. Audio-only links (podcasts, SoundCloud)
-  skip the buttons and go straight to MP3.
+- **YouTube / video-site link**: always downloaded in the **best quality available**: the highest-resolution
+  video plus the highest-quality audio, merged, with no re-encoding and no conversion. There is nothing to
+  choose. Audio-only links (podcasts, SoundCloud) arrive as the original audio file, not converted to MP3.
 - A web page that embeds a video is detected too. Several links in one message are handled one by one.
 
-Video is chosen at the resolution you pick, preferring H.264 + AAC so it plays inline in Telegram.
-**MP3** takes the highest-bitrate source stream and encodes at 320 kbit/s (the MP3 maximum), keeping the
-source's sample rate and embedding title/artist tags. MP3 is lossy: a 128-160 kbit/s YouTube source can't
-gain quality, it just stops getting worse. Change it with `MP3_QUALITY` in `.env` (e.g. `192K`, or `0` for VBR V0).
+Good to know about "best quality":
 
-Commands, optional: `/leech <url>` (force direct), `/ytdl <url> [720|audio]` (force yt-dlp),
-`/cookies`, `/status`, `/cancel`.
+- The best stream is often VP9/AV1 in a `.webm`/`.mkv` container, which Telegram shows as a file rather than
+  an inline video (H.264 `.mp4` plays inline). To prefer inline playback or cap the size, set `YTDL_SORT` in
+  `.env`, e.g. `YTDL_SORT=res:1080` (cap at 1080p) or `YTDL_SORT=vcodec:h264` (then `leechbot restart`).
+- 4K videos are big. The bot only picks streams that fit under `MAX_DOWNLOAD_MB` *and* roughly half of the free
+  disk (video and audio are on disk twice while merging). Files over ~2 GB are split into `.001`, `.002`...
+  parts (rejoin with `cat name.* > name`).
+- A link to a **playlist** downloads only its first video (and tells you). **Live streams** are refused.
+
+Commands, all optional: `/leech <url>` (force a direct download), `/ytdl <url>` (force yt-dlp), add `doc` after
+the link to upload it as a file instead of a video, `/cookies`, `/status`, `/cancel` (`/cancel all` also clears
+the queue).
 
 ## YouTube says "Sign in to confirm you're not a bot"
 

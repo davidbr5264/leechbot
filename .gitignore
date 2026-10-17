@@ -5,3 +5,5 @@ cookies.txt
 venv/
 __pycache__/
 *.pyc
+.ruff_cache/
+.pytest_cache/
