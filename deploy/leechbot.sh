@@ -42,8 +42,21 @@ set_env() {  # set_env KEY VALUE
   chown "$SVC_USER":"$SVC_USER" "$ENV_FILE" 2>/dev/null || true
   chmod 600 "$ENV_FILE"
 }
+unset_env() {  # unset_env KEY: remove the line
+  K="$1" awk 'BEGIN{FS="="; k=ENVIRON["K"]} $1!=k' "$ENV_FILE" > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
+  chown "$SVC_USER":"$SVC_USER" "$ENV_FILE" 2>/dev/null || true
+  chmod 600 "$ENV_FILE"
+}
 mask() { local v="$1"; if (( ${#v} > 8 )); then printf '%s…%s' "${v:0:4}" "${v: -3}"; else printf '(set)'; fi; }
-confirm() { local a; read -rp "$1 [y/N] " a; [[ "$a" =~ ^[Yy]$ ]]; }
+confirm() { local a=""; read -rp "$1 [y/N] " a || return 1; [[ "$a" =~ ^[Yy]$ ]]; }
+
+# Pasted values often carry terminal junk (bracketed-paste markers, CR, spaces, wrapping quotes).
+sanitize() {
+  local v="$1" esc=$'\e'
+  v="${v//${esc}\[200~/}"; v="${v//${esc}\[201~/}"; v="${v//\[200~/}"; v="${v//\[201~/}"; v="${v//$esc/}"
+  v="${v//[[:space:]]/}"; v="${v#[\"\']}"; v="${v%[\"\']}"
+  printf '%s' "$v"
+}
 
 # ---------- actions ----------
 wait_started() {
@@ -126,12 +139,20 @@ do_uninstall() {
 ask_restart() { is_active && confirm "Restart the bot now to apply this?" && do_restart; return 0; }
 
 prompt_value() {  # prompt_value "Label" REGEX [secret]  -> sets REPLY_VAL ("" = keep current)
-  local label="$1" re="$2" secret="${3:-0}" v
+  local label="$1" re="$2" secret="${3:-0}" v="" rc=0
   while true; do
-    if [[ "$secret" == 1 ]]; then read -rsp "  $label (Enter = keep current): " v; echo; else read -rp "  $label (Enter = keep current): " v; fi
+    rc=0
+    if [[ "$secret" == 1 ]]; then
+      read -rsp "  $label (Enter = keep current): " v || rc=$?; echo
+    else
+      read -rp "  $label (Enter = keep current): " v || rc=$?
+    fi
+    if (( rc != 0 )); then REPLY_VAL=""; return 0; fi   # input closed: treat as "keep current"
+    v="$(sanitize "$v")"
     [[ -z "$v" ]] && { REPLY_VAL=""; return 0; }
+    [[ "$re" == "$RE_HASH" ]] && v="${v,,}"
     [[ "$v" =~ $re ]] && { REPLY_VAL="$v"; return 0; }
-    warn "That doesn't look right, try again."
+    warn "That doesn't look right (got ${#v} characters). Try again, or press Enter to keep the current value."
   done
 }
 
@@ -171,13 +192,17 @@ set_limits() {
   for spec in "MAX_FILE_SIZE_MB|Max size of one Telegram upload part, MB (bigger files are split)|^([5-9][0-9]|[1-3][0-9]{3}|4000)$" \
               "MAX_DOWNLOAD_MB|Max size of a whole download, MB|^([1-9][0-9]{2,5})$" \
               "MIN_FREE_RAM_MB|Wait for this much free RAM before heavy jobs, MB|^([0-9]|[1-9][0-9]{1,3})$" \
-              "MP3_QUALITY|MP3 quality (320K, 256K, 192K, 128K, or 0 = VBR)|^([0-9]|(64|96|128|160|192|224|256|320)[Kk])$" \
-              "MAX_QUEUE|Max jobs waiting in the queue|^([1-9]|[1-9][0-9]|100)$"; do
+              "MAX_QUEUE|Max jobs waiting in the queue|^([1-9]|[1-9][0-9]|100)$" \
+              "YTDL_SORT|yt-dlp format sort, e.g. res:1080 or vcodec:h264 (type 'default' for best quality)|^([A-Za-z0-9:,+~*._-]+)$"; do
     IFS='|' read -r key label re <<<"$spec"
     cur="$(env_get "$key")"
     echo "  $label"
     prompt_value "$key [current: ${cur:-default}]" "$re"
-    [[ -n "$REPLY_VAL" ]] && { set_env "$key" "$REPLY_VAL"; ok "$key = $REPLY_VAL"; changed=1; }
+    if [[ "$key" == YTDL_SORT && "$REPLY_VAL" == default ]]; then
+      unset_env YTDL_SORT; ok "YTDL_SORT cleared (best quality)"; changed=1
+    elif [[ -n "$REPLY_VAL" ]]; then
+      set_env "$key" "$REPLY_VAL"; ok "$key = $REPLY_VAL"; changed=1
+    fi
   done
   [[ "${changed:-0}" == 1 ]] && ask_restart
   return 0
@@ -188,7 +213,7 @@ show_settings() {
   echo "  API_HASH    : $(mask "$(env_get API_HASH)")"
   echo "  BOT_TOKEN   : $(mask "$(env_get BOT_TOKEN)")"
   echo "  OWNER_ID    : $(env_get OWNER_ID)"
-  local k; for k in MAX_FILE_SIZE_MB MAX_DOWNLOAD_MB MIN_FREE_RAM_MB MP3_QUALITY MAX_QUEUE DOWNLOAD_DIR; do
+  local k; for k in MAX_FILE_SIZE_MB MAX_DOWNLOAD_MB MIN_FREE_RAM_MB MAX_QUEUE YTDL_SORT DOWNLOAD_DIR; do
     printf '  %-12s: %s\n' "$k" "$(env_get "$k" | sed 's/^$/(default)/')"
   done
 }
@@ -200,10 +225,10 @@ settings_menu() {
     echo "  1. Bot token"
     echo "  2. API ID and hash"
     echo "  3. Owner user ID"
-    echo "  4. Limits (upload size, RAM guard, MP3 quality, queue)"
+    echo "  4. Limits (upload size, RAM guard, queue)"
     echo "  5. Show current settings"
     echo "  0. Back"
-    read -rp "Choose [0-5]: " c
+    read -rp "Choose [0-5]: " c || return
     case "$c" in
       1) set_token ;; 2) set_api ;; 3) set_owner ;; 4) changed=0; set_limits ;; 5) show_settings ;;
       0|"") return ;; *) warn "Pick a number from the list." ;;
@@ -242,7 +267,7 @@ menu() {
     echo "   7. Update bot     8. Update yt-dlp 9. YouTube cookies"
     echo "  10. Enable autostart   11. Disable autostart"
     echo "  12. Uninstall"
-    read -rp "Choose [0-12]: " c
+    read -rp "Choose [0-12]: " c || return 0
     echo
     case "$c" in
       1) do_start ;; 2) do_stop ;; 3) do_restart ;; 4) do_status ;; 5) do_log ;;
