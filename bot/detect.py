@@ -29,15 +29,12 @@ FILE_EXT = {
 class Verdict:
     kind: str  # "direct" | "ytdl"
     head: direct.Head | None = None  # what the server said (direct links probed over the network)
-    extractor: str | None = None
 
 
 def extract_urls(text: str, entities=None) -> list[tuple[str, str | None]]:
     """[(url, custom_name)] in order of appearance. Handles hidden hyperlinks and `url | new_name.ext`."""
     text = text or ""
-    found: list[str] = []
-    for m in _URL_RE.finditer(text):
-        found.append(m.group(0).rstrip(_TRAILING))
+    found = [m.group(0).rstrip(_TRAILING) for m in _URL_RE.finditer(text)]
     for e in entities or []:  # "text link" entities hide the URL behind words
         u = getattr(e, "url", None)
         if isinstance(u, str) and u.lower().startswith(("http://", "https://")):
@@ -66,7 +63,7 @@ async def classify(url: str) -> Verdict:
 
     name = await ytdlp.match_extractor(url)  # YouTube, Vimeo, TikTok, Instagram, ...
     if name:
-        return Verdict("ytdl", extractor=name)
+        return Verdict("ytdl")
 
     head = await direct.probe(url)  # also rejects private/local addresses
     if head.status >= 400 and head.status not in (403, 405, 416):

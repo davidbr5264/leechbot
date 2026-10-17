@@ -1,6 +1,7 @@
 import asyncio
 import math
 import os
+import threading
 from pathlib import Path
 
 from . import config, media
@@ -13,10 +14,10 @@ AUDIO_EXT = {".mp3", ".m4a", ".flac", ".ogg", ".opus", ".wav", ".aac"}
 async def upload(client, chat_id: int, path: Path, on_progress, as_document: bool = False):
     ext = path.suffix.lower()
     caption = path.name[:1024]
-    common = dict(chat_id=chat_id, caption=caption, progress=on_progress)
+    common = {"chat_id": chat_id, "caption": caption, "progress": on_progress}
 
-    if not as_document and ext in VIDEO_EXT:
-        meta = await media.probe(path)
+    meta = await media.probe(path) if not as_document and (ext in VIDEO_EXT or ext in AUDIO_EXT) else None
+    if meta and ext in VIDEO_EXT and meta["width"]:  # an .mp4 without a video stream can't be sent as a video
         thumb = await media.thumbnail(path, meta["duration"])
         await client.send_video(
             video=str(path),
@@ -27,8 +28,7 @@ async def upload(client, chat_id: int, path: Path, on_progress, as_document: boo
             supports_streaming=True,
             **common,
         )
-    elif not as_document and ext in AUDIO_EXT:
-        meta = await media.probe(path)
+    elif meta and ext in AUDIO_EXT:
         await client.send_audio(
             audio=str(path), duration=meta["duration"],
             title=meta["title"] or None, performer=meta["artist"] or None, **common,
@@ -37,14 +37,15 @@ async def upload(client, chat_id: int, path: Path, on_progress, as_document: boo
         await client.send_document(document=str(path), force_document=True, **common)
 
 
-def _write_part(src: Path, dest: Path, offset: int, length: int, bufsize: int = 1 << 20) -> None:
+def _write_part(src: Path, dest: Path, offset: int, length: int, cancel: threading.Event,
+                bufsize: int = 1 << 20) -> None:
     """Copy [offset, offset+length) of src into dest using a 1 MiB buffer (constant RAM).
     Every 16 MiB the copied range is flushed and dropped from the page cache, so a multi-GB
     split can't fill RAM with cache and trigger memory-pressure throttling."""
     with open(src, "rb") as r, open(dest, "wb") as w:
         r.seek(offset)
         remaining, since_flush, pos = length, 0, offset
-        while remaining:
+        while remaining and not cancel.is_set():
             buf = r.read(min(bufsize, remaining))
             if not buf:
                 break
@@ -71,6 +72,26 @@ def _drop_cache(fd: int, offset: int = 0, length: int = 0) -> None:
         pass  # not supported on this platform/filesystem: harmless
 
 
+async def _copy_part(src: Path, dest: Path, offset: int, length: int) -> None:
+    """Run the copy in a thread. If the job is cancelled, stop the thread and wait for it, so the caller's
+    cleanup never races a thread that is still writing into the folder being deleted."""
+    cancel, finished = threading.Event(), threading.Event()
+
+    def work() -> None:
+        try:
+            _write_part(src, dest, offset, length, cancel)
+        finally:
+            finished.set()
+
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, work)
+    except asyncio.CancelledError:
+        cancel.set()
+        await loop.run_in_executor(None, finished.wait, 10)
+        raise
+
+
 async def upload_split(client, chat_id: int, path: Path, prog) -> None:
     """Upload an oversized file as name.ext.001, .002, ...
     Only one part exists on disk at a time (original + one part)."""
@@ -81,9 +102,7 @@ async def upload_split(client, chat_id: int, path: Path, prog) -> None:
 
     for i in range(n):
         part = path.with_name(f"{path.name}.{i + 1:03d}")
-        await asyncio.to_thread(
-            _write_part, path, part, i * part_size, min(part_size, size - i * part_size)
-        )
+        await _copy_part(path, part, i * part_size, min(part_size, size - i * part_size))
         prog.upload_label = f"⬆️ Uploading part {i + 1}/{n}"
         try:
             await client.send_document(

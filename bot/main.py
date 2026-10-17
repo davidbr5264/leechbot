@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pyrogram import Client, enums, filters, idle
-from pyrogram.handlers import CallbackQueryHandler, MessageHandler
-from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram.handlers import MessageHandler
+from pyrogram.types import Message
 
 from . import config, cookies, detect, procs, sysinfo, uploader
 from .downloaders import direct, ytdlp
@@ -23,15 +23,16 @@ log = logging.getLogger("leechbot")
 HELP = (
     "Just send me a link, no command needed:\n"
     "- a direct file link: I download it and upload it here\n"
-    "- a YouTube or other video-site link: I check which resolutions it really offers "
-    "and you pick one (or MP3 audio)\n\n"
+    "- a YouTube or other video-site link: I download the best quality available "
+    "(best video + best audio, no conversion)\n\n"
     "Rename a direct download:  link | new_name.ext\n\n"
     "Commands:\n"
     "/leech <url>  - force a direct download\n"
-    "/ytdl <url> [720|audio]  - force yt-dlp (no picker if you give a quality)\n"
+    "/ytdl <url>  - force yt-dlp\n"
     "/cookies  - YouTube cookies (fixes the 'not a bot' error)\n"
     "/status  - queue, memory, disk\n"
-    "/cancel  - cancel the running job"
+    "/cancel  - cancel the running job  (/cancel all also clears the queue)\n\n"
+    "Add 'doc' after a link in /leech or /ytdl to upload it as a file instead of a video."
 )
 
 
@@ -43,22 +44,12 @@ class Job:
     chat_id: int
     msg: Message  # the status message we keep editing
     name: str | None = None
-    quality: str = "720"  # ytdl: a height like "720", or "audio" (MP3)
     as_document: bool = False
-
-
-@dataclass
-class Pending:
-    url: str
-    as_document: bool
-    ts: float
 
 
 queue: asyncio.Queue = asyncio.Queue()
 state: dict = {"job": None, "task": None, "worker": None}
 job_ids = itertools.count(1)
-pending: dict[str, Pending] = {}  # quality-picker tokens
-PENDING_TTL = 900
 shutting_down = False
 _tasks: set[asyncio.Task] = set()
 
@@ -103,59 +94,7 @@ def queue_full() -> bool:
     return queue.qsize() >= config.MAX_QUEUE
 
 
-def prune_pending() -> None:
-    now = time.time()
-    for k in [k for k, v in pending.items() if now - v.ts > PENDING_TTL]:
-        del pending[k]
-    while len(pending) > 20:  # bound memory
-        pending.pop(next(iter(pending)))
-
-
-async def enqueue(job: Job) -> None:
-    await queue.put(job)
-
-
 # ---------- automatic handling of links ----------------------------------------------
-
-async def offer_formats(status: Message, url: str, as_document: bool) -> None:
-    async def waiting(text: str) -> None:
-        await _edit(status, text)
-
-    await _edit(status, "🔎 Fetching available formats…")
-    info = await ytdlp.probe(url, on_wait=waiting)
-    chat_id = status.chat.id
-
-    if not info.options:  # audio-only source: nothing to choose
-        await _edit(status, f"🎵 {info.title[:150]}\nAudio only: converting to MP3.\n{queue_text()}")
-        await enqueue(Job(next(job_ids), "ytdl", url, chat_id, status, quality="audio", as_document=as_document))
-        return
-
-    prune_pending()
-    token = secrets.token_urlsafe(6)
-    pending[token] = Pending(url, as_document, time.time())
-
-    def btn(label: str, choice: str) -> InlineKeyboardButton:
-        return InlineKeyboardButton(label, callback_data=f"yt:{token}:{choice}")
-
-    buttons = [
-        btn(o.label + (f" · ~{human_size(o.size)}" if o.size else ""), o.quality)
-        for o in info.options[:10]
-    ]
-    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-    last = []
-    if info.has_audio:
-        label = f"🎵 MP3 {config.MP3_QUALITY.lower()}" + (f" · ~{human_size(info.mp3_size)}" if info.mp3_size else "")
-        last.append(btn(label, "audio"))
-    last.append(btn("✖ Cancel", "x"))
-    rows.append(last)
-
-    details = [f"🎬 {info.title[:150]}"]
-    meta = " · ".join(x for x in (human_time(info.duration) if info.duration else "", info.uploader or "") if x)
-    if meta:
-        details.append(meta)
-    details.append("Choose a quality:")
-    await _edit(status, "\n".join(details), reply_markup=InlineKeyboardMarkup(rows))
-
 
 async def handle_url(message: Message, url: str, name: str | None = None, force: str | None = None,
                      as_document: bool = False) -> None:
@@ -165,15 +104,16 @@ async def handle_url(message: Message, url: str, name: str | None = None, force:
     status = await message.reply_text("🔎 Checking link…")
     try:
         verdict = detect.Verdict(force) if force else await detect.classify(url)
+        label = ""
         if verdict.kind == "direct":
             head = verdict.head
-            label = ""
             if head and (head.filename or head.size):
                 label = f"📎 {name or head.filename or 'file'}" + (f" ({human_size(head.size)})" if head.size else "") + "\n"
-            await _edit(status, label + queue_text())
-            await enqueue(Job(next(job_ids), "leech", url, message.chat.id, status, name=name, as_document=as_document))
+            kind = "leech"
         else:
-            await offer_formats(status, url, as_document)
+            label, kind = "🎬 Best quality available\n", "ytdl"
+        await _edit(status, label + queue_text())
+        await queue.put(Job(next(job_ids), kind, url, message.chat.id, status, name=name, as_document=as_document))
     except JobError as e:
         await _edit(status, f"❌ {e}")
     except Exception as e:  # never let one bad link kill the handler task silently
@@ -182,7 +122,7 @@ async def handle_url(message: Message, url: str, name: str | None = None, force:
 
 
 async def handle_urls(message: Message, urls: list) -> None:
-    for url, name in urls:  # one at a time: each probe may spawn a heavy process
+    for url, name in urls:  # one at a time: classifying may spawn a subprocess
         await handle_url(message, url, name)
 
 
@@ -198,50 +138,21 @@ async def cmd_start(client, message):
     await message.reply_text(HELP)
 
 
-async def cmd_leech(client, message):
+async def _command(message: Message, force: str) -> None:
     parsed = parse_args(message)
     if not parsed:
         await message.reply_text(HELP)
         return
     url, flags, name = parsed
-    bg(handle_url(message, url, name, force="direct", as_document="doc" in flags))
+    bg(handle_url(message, url, name if force == "direct" else None, force=force, as_document="doc" in flags))
+
+
+async def cmd_leech(client, message):
+    await _command(message, "direct")
 
 
 async def cmd_ytdl(client, message):
-    parsed = parse_args(message)
-    if not parsed:
-        await message.reply_text(HELP)
-        return
-    url, flags, _ = parsed
-    explicit = "audio" if "audio" in flags else next((f for f in flags if f.isdigit()), None)
-    if explicit:  # quality given: skip the picker
-        if queue_full():
-            await message.reply_text(f"The queue is full ({config.MAX_QUEUE} waiting).")
-            return
-        status = await message.reply_text(queue_text())
-        await enqueue(Job(next(job_ids), "ytdl", url, message.chat.id, status, quality=explicit, as_document="doc" in flags))
-        return
-    bg(handle_url(message, url, force="ytdl", as_document="doc" in flags))
-
-
-async def cb_ytdl(client, query: CallbackQuery):
-    data = query.data.decode() if isinstance(query.data, bytes) else query.data
-    _, token, choice = data.split(":")
-    prune_pending()
-    entry = pending.pop(token, None)
-    if not entry:
-        await _edit(query.message, "This picker expired. Send the link again.")
-    elif choice == "x":
-        await _edit(query.message, "Cancelled.")
-    elif queue_full():
-        pending[token] = entry  # keep it so they can press again
-        await query.answer("The queue is full, try again shortly.", show_alert=True)
-        return
-    else:
-        await _edit(query.message, queue_text())
-        await enqueue(Job(next(job_ids), "ytdl", entry.url, query.message.chat.id, query.message,
-                          quality=choice, as_document=entry.as_document))
-    await query.answer()
+    await _command(message, "ytdl")
 
 
 COOKIE_HELP = (
@@ -323,11 +234,22 @@ async def cmd_cookies(client, message):
 
 
 async def cmd_cancel(client, message):
+    words = (message.text or "").lower().split()[1:]
+    dropped = 0
+    if "all" in words:
+        while not queue.empty():
+            job = queue.get_nowait()
+            queue.task_done()
+            dropped += 1
+            await _edit(job.msg, "❌ Cancelled")
     task = state["task"]
-    if task and not task.done():
+    running = bool(task and not task.done())
+    if running:
         task.cancel()
-    else:
-        await message.reply_text("Nothing is running.")
+    if not running and not dropped:
+        await message.reply_text("Nothing to cancel.")
+    elif dropped:
+        await message.reply_text(f"Cancelled{' the running job and' if running else ''} {dropped} queued job(s).")
 
 
 async def cmd_status(client, message):
@@ -346,8 +268,12 @@ async def process(client: Client, job: Job):
     workdir.mkdir(parents=True, exist_ok=True)
     prog = Progress(job.msg)
     try:
+        note = ""
         if job.kind == "ytdl":
-            path = await ytdlp.download(job.url, workdir, job.quality, prog.download, on_wait=prog.edit)
+            got = await ytdlp.download(job.url, workdir, prog.download, on_wait=prog.edit)
+            path = got.path
+            if got.was_playlist:
+                note = "\n(That link is a playlist: only its first video was downloaded.)"
         else:
             path = await direct.download(job.url, workdir, job.name, prog.download)
 
@@ -355,7 +281,7 @@ async def process(client: Client, job: Job):
             await uploader.upload_split(client, job.chat_id, path, prog)
         else:
             await uploader.upload(client, job.chat_id, path, prog.upload, job.as_document)
-        await prog.edit(f"✅ Done: {path.name}")
+        await prog.edit(f"✅ Done: {path.name}{note}")
     except asyncio.CancelledError:
         await prog.edit("♻️ The bot is restarting. Send the link again." if shutting_down else "❌ Cancelled")
     except JobError as e:
@@ -451,6 +377,7 @@ async def main():
         api_hash=config.API_HASH,
         bot_token=config.BOT_TOKEN,
         workers=2,
+        sleep_threshold=120,  # ride out Telegram flood waits up to 2 min instead of failing a finished download
         parse_mode=enums.ParseMode.DISABLED,  # titles/filenames contain _ * < > that would be mangled
         max_concurrent_transmissions=1,  # one upload/download stream at a time
         max_message_cache_size=50,       # default 1000 message objects kept in RAM
@@ -467,7 +394,6 @@ async def main():
     ):
         app.add_handler(MessageHandler(handler, owner & filters.command(cmds)))
     app.add_handler(MessageHandler(on_text, owner & filters.text & ~filters.command(["start", "help", "leech", "ytdl", "cookies", "cancel", "status"])))
-    app.add_handler(CallbackQueryHandler(cb_ytdl, filters.regex(r"^yt:") & filters.user(config.OWNER_ID)))
 
     await app.start()
     await notify_interrupted(app)
