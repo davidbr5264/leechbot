@@ -24,6 +24,7 @@ CHUNK = 128 * 1024
 MAX_RETRIES = 5
 BACKOFF = 3  # seconds * attempt number, capped at 15
 FLUSH_EVERY = 16 << 20  # bytes
+DISK_CHECK_EVERY = 64 << 20  # bytes between free-space checks
 
 
 def _drop_cache(fd: int) -> None:
@@ -62,6 +63,8 @@ class _State:
 
 def _target(parts) -> str:
     path = quote(parts.path or "/", safe=_SAFE)
+    if not path.startswith("/"):
+        path = "/" + path
     return path + ("?" + quote(parts.query, safe=_SAFE + "?") if parts.query else "")
 
 
@@ -91,7 +94,11 @@ def _connect(url: str, st: _State):
     if parts.scheme == "https":
         sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
     cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
-    conn = cls(host, port, timeout=60)
+    try:
+        header_host = host.encode("idna").decode("ascii")  # http.client needs an ASCII Host header
+    except UnicodeError:
+        raise JobError("That link has an invalid hostname.") from None
+    conn = cls(header_host, port, timeout=60)
     conn.sock = sock  # pre-connected: http.client won't resolve/connect again
     st.sock = sock
     return conn, parts
@@ -175,7 +182,7 @@ def _worker(url: str, dest_dir: Path, name: str | None, st: _State) -> Path:
             except OSError as e:
                 raise JobError(f"Can't write the download: {e.strerror or e}") from e
             with f:
-                unflushed = 0
+                unflushed = since_disk_check = 0
                 while True:
                     chunk = resp.read1(CHUNK)
                     if not chunk:
@@ -191,9 +198,14 @@ def _worker(url: str, dest_dir: Path, name: str | None, st: _State) -> Path:
                     except OSError as e:
                         raise JobError(f"Disk write failed: {e.strerror or e}") from e
                     done += len(chunk)
+                    since_disk_check += len(chunk)
                     st.done = done
                     if done > config.MAX_DOWNLOAD:
                         raise JobError("Download exceeded the size limit; aborted.")
+                    if since_disk_check >= DISK_CHECK_EVERY:  # servers that don't announce a size can fill the disk
+                        since_disk_check = 0
+                        if free_space(dest_dir) < config.MIN_FREE_SPACE // 2:
+                            raise JobError("The disk is almost full, so the download was stopped.")
                     if st.cancel.is_set():
                         raise _Cancelled
             if total and done < total:
@@ -265,7 +277,7 @@ async def probe(url: str) -> Head:
     fut = asyncio.get_running_loop().run_in_executor(None, _probe_blocking, url, st)
     try:
         return await asyncio.wait_for(fut, 45)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         st.abort()
         raise JobError("That server didn't answer in time.") from None
     except (http.client.HTTPException, OSError) as e:
