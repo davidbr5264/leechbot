@@ -2,7 +2,7 @@
 # =============================================================================
 #  Telegram leech bot - one-command installer
 #
-#    bash <(curl -Ls https://raw.githubusercontent.com/YOUR-USER/leechbot/main/install.sh)
+#    bash <(curl -Ls https://raw.githubusercontent.com/davidbr5264/leechbot/main/install.sh)
 #
 #  It downloads the bot, installs everything it needs, asks for your Telegram
 #  credentials, starts the service and adds a `leechbot` management command.
@@ -108,10 +108,11 @@ Credentials can also be given as environment variables (API_ID, API_HASH,
 BOT_TOKEN, OWNER_ID). If the bot is already installed, existing values in
 its .env are reused.
 
-Where the bot is downloaded from (when this script runs without the bot's files):
+Where the bot is downloaded from (when this script runs without the bot's files).
+By default that is leechbot.zip in the root of the GitHub repository:
   LEECHBOT_REPO=user/repo   GitHub repository   (default: $REPO)
   LEECHBOT_REF=main         branch or tag
-  LEECHBOT_URL=<url>        exact tarball URL (overrides the two above)
+  LEECHBOT_URL=<url>        exact archive URL, .zip or .tar.gz (overrides the two above)
   LEECHBOT_SHA256=<hash>    refuse to install unless the download matches
 EOF
 }
@@ -367,14 +368,35 @@ ensure_downloader() {
   esac
 }
 
+# extract_package FILE DEST: unpack a .zip or .tar.gz (told apart by content, not by name).
+extract_package() {
+  local f="$1" d="$2"
+  mkdir -p "$d"
+  if [[ "$(head -c 2 "$f")" == "PK" ]]; then
+    if ! command -v unzip >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+      case "$PM" in
+        apt) run "${APT[@]}" update -qq; run "${APT[@]}" install -y -qq unzip ;;
+        dnf|yum) run "$PM" install -y -q unzip ;;
+      esac
+    fi
+    if command -v unzip >/dev/null 2>&1; then
+      unzip -q -o "$f" -d "$d"            # refuses entries that try to escape $d
+    else
+      python3 -m zipfile -e "$f" "$d"     # also sanitises names ("..", absolute paths)
+    fi
+  else
+    tar -xzf "$f" -C "$d"
+  fi
+}
+
 # Run on its own (bash <(curl ...)) or with --update: fetch the bot's files, then hand over to the
 # downloaded copy of this installer with the same arguments.
 bootstrap() {
   if (( ! FORCE_DOWNLOAD )) && [[ -n "$SRC_DIR" && -f "$SRC_DIR/bot/main.py" ]]; then return 0; fi
   local url="$SOURCE_URL"
   if [[ -z "$url" && -f "$INSTALL_DIR/.source" ]]; then url="$(sed -n 's/^LEECHBOT_URL=//p' "$INSTALL_DIR/.source" | tail -n1)"; fi
-  [[ -n "$url" ]] || url="https://github.com/${REPO}/archive/${REF}.tar.gz"
-  [[ "$url" != *YOUR-USER* ]] || die "This copy of the installer doesn't know where the bot is hosted. Set LEECHBOT_REPO=<user>/<repo> (or LEECHBOT_URL=<tarball url>), or edit REPO at the top of install.sh."
+  [[ -n "$url" ]] || url="https://raw.githubusercontent.com/${REPO}/${REF}/leechbot.zip"
+  [[ "$url" != *YOUR-USER* ]] || die "This copy of the installer doesn't know where the bot is hosted. Set LEECHBOT_REPO=<user>/<repo> (or LEECHBOT_URL=<archive url>), or edit REPO at the top of install.sh."
 
   step "Downloading the leech bot"
   ensure_downloader
@@ -382,19 +404,25 @@ bootstrap() {
   trap 'rm -rf "$BOOT_TMP"' EXIT
   trap 'rm -rf "$BOOT_TMP"; exit 130' INT
   trap 'rm -rf "$BOOT_TMP"; exit 143' TERM
-  if ! fetch "$url" "$BOOT_TMP/pkg.tar.gz"; then die "Download failed: $url"; fi
+  local pkg="$BOOT_TMP/package"
+  if ! fetch "$url" "$pkg"; then die "Download failed: $url"; fi
   if [[ -n "${LEECHBOT_SHA256:-}" ]]; then
-    local got; got="$(sha256sum "$BOOT_TMP/pkg.tar.gz" | cut -d' ' -f1)"
+    local got; got="$(sha256sum "$pkg" | cut -d' ' -f1)"
     if [[ "$got" != "${LEECHBOT_SHA256,,}" ]]; then die "Checksum mismatch (expected ${LEECHBOT_SHA256}, got ${got}). Refusing to install."; fi
     ok "Checksum verified"
   fi
-  mkdir -p "$BOOT_TMP/src"
-  if ! tar -xzf "$BOOT_TMP/pkg.tar.gz" -C "$BOOT_TMP/src" --strip-components=1 2>/dev/null; then die "That download isn't a valid archive: $url"; fi
-  if [[ ! -f "$BOOT_TMP/src/install.sh" || ! -f "$BOOT_TMP/src/bot/main.py" ]]; then die "That archive doesn't look like the leech bot: $url"; fi
-  ok "Downloaded $(du -h "$BOOT_TMP/pkg.tar.gz" | cut -f1)"
+  if ! extract_package "$pkg" "$BOOT_TMP/src" >>"$LOG" 2>&1; then die "That download isn't a valid zip or tar.gz archive: $url"; fi
+  # The files may sit directly in the archive or inside one top-level folder (leechbot/...).
+  local root="$BOOT_TMP/src" sub
+  if [[ ! -f "$root/install.sh" ]]; then
+    sub="$(find "$root" -mindepth 2 -maxdepth 2 -name install.sh -print -quit 2>/dev/null || true)"
+    if [[ -n "$sub" ]]; then root="$(dirname "$sub")"; fi
+  fi
+  if [[ ! -f "$root/install.sh" || ! -f "$root/bot/main.py" ]]; then die "That archive doesn't look like the leech bot: $url"; fi
+  ok "Downloaded $(du -h "$pkg" | cut -f1)"
 
   local rc=0
-  LEECHBOT_URL="$url" bash "$BOOT_TMP/src/install.sh" "${FWD_ARGS[@]+"${FWD_ARGS[@]}"}" || rc=$?
+  LEECHBOT_URL="$url" bash "$root/install.sh" "${FWD_ARGS[@]+"${FWD_ARGS[@]}"}" || rc=$?
   exit "$rc"
 }
 
