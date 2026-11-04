@@ -43,7 +43,7 @@ SWAP_MB=1024
 # A fresh server is often busy with unattended-upgrades holding the apt lock: wait for it instead of failing.
 APT=(apt-get -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3)
 PIP_OPTS=(--no-cache-dir -q --default-timeout 60 --retries 5)
-DO_SWAP=1 DO_DENO=1 DO_SYSTEMD=1 DO_TOKEN_CHECK=1 DO_ZRAM=1 DO_EARLYOOM=1
+DO_SWAP=1 DO_JS=1 DO_SYSTEMD=1 DO_TOKEN_CHECK=1 DO_ZRAM=1 DO_EARLYOOM=1
 ASSUME_YES=0 UNINSTALL=0 PURGE=0
 API_ID="${API_ID:-}" API_HASH="${API_HASH:-}" BOT_TOKEN="${BOT_TOKEN:-}" OWNER_ID="${OWNER_ID:-}"
 BOT_USERNAME=""
@@ -96,7 +96,7 @@ Options:
   --no-swap            Never create a swap file
   --no-zram            Don't set up compressed swap in RAM (zram)
   --no-earlyoom        Don't install earlyoom (kills the right process before the server thrashes)
-  --no-deno            Don't install the Deno JS runtime (YouTube needs one!)
+  --no-quickjs         Don't install the QuickJS JS runtime (YouTube needs one: QuickJS, Deno, Node or Bun)
   --no-systemd         Don't install systemd units
   --skip-token-check   Don't validate the bot token against api.telegram.org
   -y, --yes            Non-interactive: never prompt, fail if input is missing
@@ -132,7 +132,7 @@ while [[ $# -gt 0 ]]; do
     --no-swap)     DO_SWAP=0; shift ;;
     --no-zram)     DO_ZRAM=0; shift ;;
     --no-earlyoom) DO_EARLYOOM=0; shift ;;
-    --no-deno)     DO_DENO=0; shift ;;
+    --no-quickjs|--no-deno) DO_JS=0; shift ;;
     --no-systemd)  DO_SYSTEMD=0; shift ;;
     --skip-token-check) DO_TOKEN_CHECK=0; shift ;;
     -y|--yes)      ASSUME_YES=1; shift ;;
@@ -204,7 +204,7 @@ do_uninstall() {
   else
     info "Kept $INSTALL_DIR (config, session). Use --purge to delete it."
   fi
-  info "Left in place (shared): system packages, /usr/local/bin/deno, swap/zram, earlyoom."
+  info "Left in place (shared): system packages, /usr/local/bin/qjs, swap/zram, earlyoom."
   exit 0
 }
 
@@ -433,7 +433,7 @@ preflight() {
   mkdir -p "$INSTALL_DIR"
   local free_mb; free_mb="$(df -Pm "$INSTALL_DIR" | awk 'NR==2{print $4}')"
   if (( free_mb < 1200 )); then
-    warn "Only ${free_mb} MB free disk. The install needs ~1 GB (ffmpeg, Deno, Python deps) plus room for downloads."
+    warn "Only ${free_mb} MB free disk. The install needs ~1 GB (ffmpeg, QuickJS, Python deps) plus room for downloads."
   else
     ok "Free disk: ${free_mb} MB"
   fi
@@ -453,9 +453,9 @@ install_packages() {
       export DEBIAN_FRONTEND=noninteractive
       run "${APT[@]}" update -qq
       run "${APT[@]}" install -y -qq --no-install-recommends \
-        python3 python3-venv python3-pip python3-dev gcc libc6-dev ffmpeg curl ca-certificates unzip ;;
+        python3 python3-venv python3-pip ffmpeg curl ca-certificates unzip ;;
     dnf|yum)
-      run "$PM" install -y -q python3 python3-pip python3-devel gcc curl ca-certificates unzip
+      run "$PM" install -y -q python3 python3-pip curl ca-certificates unzip
       run_try "$PM" install -y -q ffmpeg-free || run_try "$PM" install -y -q ffmpeg \
         || warn "ffmpeg isn't in your repos (try enabling RPM Fusion/EPEL). Video merging and thumbnails need it." ;;
   esac
@@ -495,9 +495,10 @@ copy_files() {
   old_tok="$(env_get BOT_TOKEN)"; old_id="$(env_get API_ID)"; old_hash="$(env_get API_HASH)"
   if [[ ( -n "$old_tok" && "$old_tok" != "$BOT_TOKEN" ) || ( -n "$old_id" && "$old_id" != "$API_ID" ) \
         || ( -n "$old_hash" && "$old_hash" != "$API_HASH" ) ]]; then
-    rm -f "$INSTALL_DIR"/leechbot.session*   # a Telegram session belongs to one bot/app; a stale one would ignore new credentials
+    rm -f "$INSTALL_DIR"/leechbot*.session*   # a Telegram session belongs to one bot/app; a stale one would ignore new credentials
     ok "Credentials changed: cleared the old Telegram session"
   fi
+  rm -f "$INSTALL_DIR"/leechbot.session*   # leftover Pyrogram session (Telethon uses leechbot-tl.session)
   [[ -z "$SOURCE_URL" ]] || printf 'LEECHBOT_URL=%s\n' "$SOURCE_URL" > "$INSTALL_DIR/.source"
   set_env API_ID    "$API_ID"
   set_env API_HASH  "$API_HASH"
@@ -519,17 +520,19 @@ setup_venv() {
   step "Python environment"
   [[ -x "$VENV/bin/python" ]] || run "$PY" -m venv "$VENV"
   run "$VENV/bin/python" -m pip install "${PIP_OPTS[@]}" --upgrade pip wheel
-  # tgcrypto compiles C code; install it separately so a build failure isn't fatal.
+  # cryptg is an optional C speed-up (pre-built wheels); install it separately so a missing wheel isn't fatal.
   local req; req="$(mktemp)"
-  grep -v -i -E '^[[:space:]]*(tgcrypto|#|$)' "$INSTALL_DIR/requirements.txt" | sed 's/[[:space:]]*#.*//' > "$req"
+  grep -v -i -E '^[[:space:]]*(cryptg|#|$)' "$INSTALL_DIR/requirements.txt" | sed 's/[[:space:]]*#.*//' > "$req"
   run "$VENV/bin/python" -m pip install "${PIP_OPTS[@]}" -r "$req"
   rm -f "$req"
-  if run_try "$VENV/bin/python" -m pip install "${PIP_OPTS[@]}" tgcrypto; then
-    ok "Dependencies installed (with TgCrypto for fast uploads)"
+  # Upgrading from the Pyrogram version: its packages are dead weight now (and the two must not mix).
+  run_try "$VENV/bin/python" -m pip uninstall -y -q kurigram pyrogram tgcrypto || true
+  if run_try "$VENV/bin/python" -m pip install "${PIP_OPTS[@]}" cryptg; then
+    ok "Dependencies installed (with cryptg for faster transfers)"
   else
-    warn "TgCrypto failed to build; uploads will work but slower."
+    warn "cryptg isn't available for this platform; transfers work but use a bit more CPU."
   fi
-  run "$VENV/bin/python" -c 'import pyrogram, dotenv, yt_dlp'
+  run "$VENV/bin/python" -c 'import telethon, yt_dlp'
   ok "yt-dlp $("$VENV/bin/python" -m yt_dlp --version)"
 
   # Lazy extractors cut ~17 MB of RAM from every yt-dlp job. Optional: failure = normal mode.
@@ -541,27 +544,25 @@ setup_venv() {
   esac
 }
 
-install_deno() {
-  step "JavaScript runtime for YouTube (Deno)"
-  if (( ! DO_DENO )); then info "Skipped (--no-deno). YouTube downloads need Deno, Node, Bun or QuickJS."; return 0; fi
-  if command -v deno >/dev/null 2>&1; then ok "Already installed: $(deno --version | head -n1)"; return 0; fi
-  local arch tmp
+install_quickjs() {
+  step "JavaScript runtime for YouTube (QuickJS-ng, ~10 MB of RAM instead of Deno's ~40 MB)"
+  if (( ! DO_JS )); then info "Skipped (--no-quickjs). YouTube downloads need QuickJS, Deno, Node or Bun."; return 0; fi
+  local bin=/usr/local/bin/qjs arch tmp
+  if [[ -x "$bin" ]] && "$bin" --help 2>&1 | grep -qi 'quickjs-ng'; then ok "Already installed: $("$bin" --help 2>&1 | head -n1)"; return 0; fi
   case "$(uname -m)" in
     x86_64|amd64)  arch=x86_64 ;;
     aarch64|arm64) arch=aarch64 ;;
-    *) warn "No prebuilt Deno for $(uname -m). Install a JS runtime manually for YouTube support."; return 0 ;;
+    *) warn "No prebuilt QuickJS for $(uname -m). Install a JS runtime manually for YouTube support."; return 0 ;;
   esac
-  tmp="$(mktemp -d)"
-  if run_try curl -fsSL --retry 3 -o "$tmp/deno.zip" \
-       "https://github.com/denoland/deno/releases/latest/download/deno-${arch}-unknown-linux-gnu.zip" \
-     && run_try unzip -o -q "$tmp/deno.zip" -d /usr/local/bin \
-     && chmod 755 /usr/local/bin/deno && /usr/local/bin/deno --version >>"$LOG" 2>&1; then
-    ok "Installed $(/usr/local/bin/deno --version | head -n1)"
+  tmp="$(mktemp)"
+  if run_try curl -fsSL --retry 3 -o "$tmp" "https://github.com/quickjs-ng/quickjs/releases/latest/download/qjs-linux-${arch}" \
+     && chmod 755 "$tmp" && "$tmp" --help 2>&1 | grep -qi 'quickjs-ng'; then
+    mv "$tmp" "$bin"
+    ok "Installed $("$bin" --help 2>&1 | head -n1)"
   else
-    rm -f /usr/local/bin/deno
-    warn "Couldn't install Deno (no network, or a non-glibc system). YouTube downloads may fail until a JS runtime is installed."
+    rm -f "$tmp"
+    warn "Couldn't install QuickJS (no network, or a non-glibc system). YouTube downloads may fail until a JS runtime is installed."
   fi
-  rm -rf "$tmp"
 }
 
 setup_swap() {
@@ -831,7 +832,7 @@ main() {
   copy_files
   install_ctl
   setup_venv
-  install_deno
+  install_quickjs
   setup_swap
   setup_zram
   setup_earlyoom
