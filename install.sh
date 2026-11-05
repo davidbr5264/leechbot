@@ -4,12 +4,13 @@
 #
 #    bash <(curl -Ls https://raw.githubusercontent.com/davidbr5264/leechbot/main/install.sh)
 #
-#  It downloads the bot, installs everything it needs, asks for your Telegram
-#  credentials, starts the service and adds a `leechbot` management command.
+#  It downloads the bot, installs everything it needs and adds a `leechbot`
+#  management command. It asks for nothing: set your Telegram credentials
+#  afterwards in that menu (`leechbot settings`), which then starts the bot.
 #
 #  Other ways to run it:
 #    sudo bash install.sh                           (from an unpacked copy)
-#    sudo bash install.sh -y --api-id 123 --api-hash <hash> --bot-token <token> --owner-id 456
+#    sudo bash install.sh -y --api-id 123 --api-hash <hash> --bot-token <token> --owner-id 456   (all optional)
 #    sudo bash install.sh --update                  (fetch the newest version, keep settings)
 #    sudo bash install.sh --uninstall [--purge]
 #
@@ -85,7 +86,7 @@ usage() {
 Telegram leech bot installer
 
 Options:
-  --api-id ID          Telegram API ID        (my.telegram.org)
+  --api-id ID          Telegram API ID        (optional; otherwise set it in the `leechbot` menu)
   --api-hash HASH      Telegram API hash
   --bot-token TOKEN    Bot token              (@BotFather)
   --owner-id ID        Your numeric Telegram user ID (@userinfobot)
@@ -99,14 +100,15 @@ Options:
   --no-quickjs         Don't install the QuickJS JS runtime (YouTube needs one: QuickJS, Deno, Node or Bun)
   --no-systemd         Don't install systemd units
   --skip-token-check   Don't validate the bot token against api.telegram.org
-  -y, --yes            Non-interactive: never prompt, fail if input is missing
+  -y, --yes            Never ask for confirmation (only matters for --uninstall --purge)
   --update             Download the newest version and install it (settings are kept)
   --uninstall          Remove the service (add --purge to delete data + user)
   -h, --help           Show this help
 
-Credentials can also be given as environment variables (API_ID, API_HASH,
-BOT_TOKEN, OWNER_ID). If the bot is already installed, existing values in
-its .env are reused.
+The installer never prompts. The four credentials are optional here: pass them
+as options or environment variables (API_ID, API_HASH, BOT_TOKEN, OWNER_ID) for
+a hands-off install, or leave them out and set them afterwards with `leechbot
+settings`. If the bot is already installed, existing values in its .env are kept.
 
 Where the bot is downloaded from (when this script runs without the bot's files).
 By default that is leechbot.zip in the root of the GitHub repository:
@@ -234,20 +236,6 @@ sanitize() {
   printf '%s' "$v"
 }
 
-# read_value VAR "prompt" secret: read one line into VAR. Never dies on odd terminals or EOF without saying why.
-read_value() {
-  local __var=$1 __prompt=$2 __secret=${3:-0} __line="" __rc=0
-  if (( __secret )); then
-    IFS= read -rsp "$__prompt" __line || __rc=$?
-    echo
-  else
-    IFS= read -rp "$__prompt" __line || __rc=$?
-  fi
-  (( __rc == 0 )) || die "Input ended unexpectedly (is this an interactive terminal?). Run the installer in a normal terminal, or pass the values as options (see --help)."
-  printf -v "$__var" '%s' "$__line"
-}
-
-# what a valid value looks like, for the "try again" message
 expected() {
   case "$1" in
     API_ID)    echo "digits only, e.g. 1234567" ;;
@@ -256,34 +244,6 @@ expected() {
     OWNER_ID)  echo "digits only" ;;
     *)         echo "see the hint above" ;;
   esac
-}
-
-# ask VAR "Prompt" REGEX [secret] [hint]
-ask() {
-  local var=$1 prompt=$2 re=$3 secret=${4:-0} hint=${5:-} val="${!1:-}" flag typed=0
-  flag="--$(printf '%s' "${var//_/-}" | tr '[:upper:]' '[:lower:]')"
-  val="$(sanitize "$val")"
-  if [[ -z "$val" ]]; then
-    val="$(env_get "$var")"
-    if [[ -n "$val" ]]; then info "$var: using the existing value from $ENV_FILE"; fi
-  fi
-  while true; do
-    if [[ -z "$val" ]]; then
-      (( INTERACTIVE )) || die "Missing $var. Run this in an interactive terminal (over SSH use: ssh -t host), or pass $flag / set $var."
-      if [[ -n "$hint" && $typed -eq 0 ]]; then info "$hint"; fi
-      read_value val "    $prompt: " "$secret"
-      val="$(sanitize "$val")"; typed=1
-    fi
-    if [[ "$var" == API_HASH ]]; then val="${val,,}"; fi   # my.telegram.org shows it in lowercase
-    if [[ "$val" =~ $re ]]; then
-      printf -v "$var" '%s' "$val"
-      if (( secret && typed )); then info "received ${#val} characters (ends ...${val: -4})"; fi
-      return 0
-    fi
-    (( INTERACTIVE )) || die "$var has an invalid format (expected: $(expected "$var"))."
-    warn "That doesn't look right: got ${#val} characters. Expected: $(expected "$var"). Try again."
-    val=""
-  done
 }
 
 check_token() {
@@ -306,30 +266,36 @@ check_token() {
   rm -f "$body"
 }
 
+# Credentials are optional at install time: a value given as an option/environment variable (or already in
+# .env) is used, anything missing is set later in the `leechbot` menu. The installer never prompts for them.
+resolve() {  # resolve VAR REGEX: option/env value, else the one in .env, else empty (= not set yet)
+  local var=$1 re=$2 val
+  val="$(sanitize "${!var:-}")"
+  [[ -n "$val" ]] || val="$(env_get "$var")"
+  if [[ "$var" == API_HASH ]]; then val="${val,,}"; fi   # my.telegram.org shows it in lowercase
+  if [[ -n "$val" && ! "$val" =~ $re ]]; then die "$var has an invalid format (expected: $(expected "$var"))."; fi
+  printf -v "$var" '%s' "$val"
+}
+
+# Names of the required settings that are still empty in .env (empty output = fully configured).
+missing_settings() {
+  local k out=()
+  for k in API_ID API_HASH BOT_TOKEN OWNER_ID; do [[ -n "$(env_get "$k")" ]] || out+=("$k"); done
+  printf '%s' "${out[*]}"
+}
+
 collect_config() {
   step "Configuration"
-  ask API_ID    "API ID"        "$RE_ID"    0 "Get API ID/hash at https://my.telegram.org -> API development tools"
-  ask API_HASH  "API hash"      "$RE_HASH"  1
-  ask BOT_TOKEN "Bot token"     "$RE_TOKEN" 1 "Create a bot with @BotFather and paste its token."
-  # Validate right away: a typo should be reported now, not after you've answered everything else.
-  if command -v curl >/dev/null 2>&1; then check_token; else TOKEN_DEFERRED=1; fi
-  if [[ -n "$OWNER_ID" || -n "$(env_get OWNER_ID)" ]]; then
-    DETECT_OWNER=0
-    ask OWNER_ID "Your Telegram user ID" "$RE_ID" 0
+  resolve API_ID "$RE_ID"; resolve API_HASH "$RE_HASH"; resolve BOT_TOKEN "$RE_TOKEN"; resolve OWNER_ID "$RE_ID"
+  if [[ -n "$OWNER_ID" ]]; then DETECT_OWNER=0; fi
+  if [[ -n "$BOT_TOKEN" ]]; then
+    # Validate right away: a typo should be reported now, not after the heavy work.
+    if command -v curl >/dev/null 2>&1; then check_token; else TOKEN_DEFERRED=1; fi
   elif (( DETECT_OWNER )); then
-    info "Your Telegram user ID will be detected near the end of the install."
-  elif (( INTERACTIVE )); then
-    info "Only your Telegram account may use the bot. Paste your numeric user ID (from @userinfobot),"
-    info "or just press Enter and I'll detect it with a one-tap link at the end."
-    while true; do
-      read_value OWNER_ID "    Your Telegram user ID (Enter = detect automatically): "
-      OWNER_ID="$(sanitize "$OWNER_ID")"
-      if [[ -z "$OWNER_ID" ]]; then DETECT_OWNER=1; break; fi
-      [[ "$OWNER_ID" =~ $RE_ID ]] && break
-      warn "That doesn't look right, try again."
-    done
-  else
-    die "Missing OWNER_ID (use --owner-id, or --detect-owner to link your account by tapping a link in Telegram)."
+    die "--detect-owner needs a bot token (--bot-token)."
+  fi
+  if [[ -z "$API_ID$API_HASH$BOT_TOKEN$OWNER_ID" ]]; then
+    info "No credentials given: you will set them in the leechbot menu once the install is done."
   fi
 }
 
@@ -493,17 +459,16 @@ copy_files() {
   if [[ ! -f "$ENV_FILE" ]]; then ( umask 077; cp "$INSTALL_DIR/.env.example" "$ENV_FILE" ); fi
   local old_tok old_id old_hash
   old_tok="$(env_get BOT_TOKEN)"; old_id="$(env_get API_ID)"; old_hash="$(env_get API_HASH)"
-  if [[ ( -n "$old_tok" && "$old_tok" != "$BOT_TOKEN" ) || ( -n "$old_id" && "$old_id" != "$API_ID" ) \
-        || ( -n "$old_hash" && "$old_hash" != "$API_HASH" ) ]]; then
+  if [[ ( -n "$old_tok" && -n "$BOT_TOKEN" && "$old_tok" != "$BOT_TOKEN" ) \
+        || ( -n "$old_id" && -n "$API_ID" && "$old_id" != "$API_ID" ) \
+        || ( -n "$old_hash" && -n "$API_HASH" && "$old_hash" != "$API_HASH" ) ]]; then
     rm -f "$INSTALL_DIR"/leechbot*.session*   # a Telegram session belongs to one bot/app; a stale one would ignore new credentials
     ok "Credentials changed: cleared the old Telegram session"
   fi
   rm -f "$INSTALL_DIR"/leechbot.session*   # leftover Pyrogram session (Telethon uses leechbot-tl.session)
   [[ -z "$SOURCE_URL" ]] || printf 'LEECHBOT_URL=%s\n' "$SOURCE_URL" > "$INSTALL_DIR/.source"
-  set_env API_ID    "$API_ID"
-  set_env API_HASH  "$API_HASH"
-  set_env BOT_TOKEN "$BOT_TOKEN"
-  [[ -z "$OWNER_ID" ]] || set_env OWNER_ID "$OWNER_ID"
+  local k
+  for k in API_ID API_HASH BOT_TOKEN OWNER_ID; do [[ -z "${!k}" ]] || set_env "$k" "${!k}"; done
   chmod 600 "$ENV_FILE"
   ok "Wrote $ENV_FILE (mode 600)"
 }
@@ -780,8 +745,20 @@ start_service() {
     return 0
   fi
   run systemctl daemon-reload
-  run systemctl enable leechbot.service leechbot-ytdlp-update.timer
+  run systemctl enable leechbot-ytdlp-update.timer
   run systemctl start leechbot-ytdlp-update.timer
+
+  # Not configured yet: the unit restarts forever, so starting it now would only crash-loop. Leave it
+  # disabled; the `leechbot` menu starts it (and enables autostart) once the settings are complete.
+  local missing; missing="$(missing_settings)"
+  if [[ -n "$missing" ]]; then
+    run_try systemctl disable leechbot.service
+    : > "$INSTALL_DIR/.first-run"
+    info "The bot isn't started yet. Still to set: $missing"
+    return 0
+  fi
+  rm -f "$INSTALL_DIR/.first-run"
+  run systemctl enable leechbot.service
 
   local since started=0
   since="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -804,7 +781,19 @@ start_service() {
 
 summary() {
   printf '\n%s%s Installed!%s\n\n' "$C_G" "✔" "$C_0"
-  [[ -n "$BOT_USERNAME" ]] && info "Open Telegram and send /start to @$BOT_USERNAME (only user $OWNER_ID is allowed)."
+  local missing; missing="$(missing_settings)"
+  if [[ -n "$missing" ]]; then
+    printf '%sOne more step: set the credentials%s (still missing: %s)\n' "$C_Y" "$C_0" "$missing"
+    cat <<EOF
+      1. run:  leechbot settings
+      2. set:  1 Bot token, 2 API ID and hash, 3 Owner user ID
+         (API ID/hash: https://my.telegram.org -> API development tools; token: @BotFather; your ID: @userinfobot)
+      3. when everything is set, it offers to start the bot
+
+EOF
+  elif [[ -n "$BOT_USERNAME" ]]; then
+    info "Open Telegram and send /start to @$BOT_USERNAME (only user $OWNER_ID is allowed)."
+  fi
   cat <<EOF
     Use it      : just send the bot a link (direct file or video site), no commands needed
     Manage      : leechbot            (menu: start/stop/restart, logs, settings, update, uninstall)
