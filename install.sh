@@ -86,7 +86,7 @@ usage() {
 Telegram leech bot installer
 
 Options:
-  --api-id ID          Telegram API ID        (optional; otherwise set it in the `leechbot` menu)
+  --api-id ID          Telegram API ID        (optional; otherwise set it in the 'leechbot' menu)
   --api-hash HASH      Telegram API hash
   --bot-token TOKEN    Bot token              (@BotFather)
   --owner-id ID        Your numeric Telegram user ID (@userinfobot)
@@ -107,8 +107,8 @@ Options:
 
 The installer never prompts. The four credentials are optional here: pass them
 as options or environment variables (API_ID, API_HASH, BOT_TOKEN, OWNER_ID) for
-a hands-off install, or leave them out and set them afterwards with `leechbot
-settings`. If the bot is already installed, existing values in its .env are kept.
+a hands-off install, or leave them out and set them afterwards with 'leechbot
+settings'. If the bot is already installed, existing values in its .env are kept.
 
 Where the bot is downloaded from (when this script runs without the bot's files).
 By default that is leechbot.zip in the root of the GitHub repository:
@@ -421,7 +421,8 @@ install_packages() {
       run "${APT[@]}" install -y -qq --no-install-recommends \
         python3 python3-venv python3-pip ffmpeg curl ca-certificates unzip ;;
     dnf|yum)
-      run "$PM" install -y -q python3 python3-pip curl ca-certificates unzip
+      run "$PM" install -y -q python3 python3-pip ca-certificates unzip
+      command -v curl >/dev/null 2>&1 || run "$PM" install -y -q curl   # keep a preinstalled curl-minimal
       run_try "$PM" install -y -q ffmpeg-free || run_try "$PM" install -y -q ffmpeg \
         || warn "ffmpeg isn't in your repos (try enabling RPM Fusion/EPEL). Video merging and thumbnails need it." ;;
   esac
@@ -513,7 +514,7 @@ install_quickjs() {
   step "JavaScript runtime for YouTube (QuickJS-ng, ~10 MB of RAM instead of Deno's ~40 MB)"
   if (( ! DO_JS )); then info "Skipped (--no-quickjs). YouTube downloads need QuickJS, Deno, Node or Bun."; return 0; fi
   local bin=/usr/local/bin/qjs arch tmp
-  if [[ -x "$bin" ]] && "$bin" --help 2>&1 | grep -qi 'quickjs-ng'; then ok "Already installed: $("$bin" --help 2>&1 | head -n1)"; return 0; fi
+  if [[ -x "$bin" && "$("$bin" --help 2>&1 || true)" == *[Qq]uick[Jj][Ss]-ng* ]]; then ok "Already installed: $("$bin" --help 2>&1 | head -n1)"; return 0; fi
   case "$(uname -m)" in
     x86_64|amd64)  arch=x86_64 ;;
     aarch64|arm64) arch=aarch64 ;;
@@ -521,7 +522,7 @@ install_quickjs() {
   esac
   tmp="$(mktemp)"
   if run_try curl -fsSL --retry 3 -o "$tmp" "https://github.com/quickjs-ng/quickjs/releases/latest/download/qjs-linux-${arch}" \
-     && chmod 755 "$tmp" && "$tmp" --help 2>&1 | grep -qi 'quickjs-ng'; then
+     && chmod 755 "$tmp" && [[ "$("$tmp" --help 2>&1 || true)" == *[Qq]uick[Jj][Ss]-ng* ]]; then
     mv "$tmp" "$bin"
     ok "Installed $("$bin" --help 2>&1 | head -n1)"
   else
@@ -765,7 +766,7 @@ start_service() {
   run systemctl restart leechbot.service
   info "Waiting for the bot to connect to Telegram..."
   for _ in $(seq 1 40); do
-    if journalctl -u leechbot --since "$since" --no-pager 2>/dev/null | grep -q "Bot started"; then
+    if [[ "$(journalctl -u leechbot --since "$since" --no-pager 2>/dev/null || true)" == *"Bot started"* ]]; then
       started=1; break
     fi
     systemctl is-failed --quiet leechbot.service && break
