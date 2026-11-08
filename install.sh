@@ -44,7 +44,7 @@ SWAP_MB=1024
 # A fresh server is often busy with unattended-upgrades holding the apt lock: wait for it instead of failing.
 APT=(apt-get -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3)
 PIP_OPTS=(--no-cache-dir -q --default-timeout 60 --retries 5)
-DO_SWAP=1 DO_JS=1 DO_SYSTEMD=1 DO_TOKEN_CHECK=1 DO_ZRAM=1 DO_EARLYOOM=1
+DO_SWAP=1 DO_JS=1 DO_SYSTEMD=1 DO_TOKEN_CHECK=1 DO_ZRAM=1 DO_EARLYOOM=1 DO_TUNE=1
 ASSUME_YES=0 UNINSTALL=0 PURGE=0
 API_ID="${API_ID:-}" API_HASH="${API_HASH:-}" BOT_TOKEN="${BOT_TOKEN:-}" OWNER_ID="${OWNER_ID:-}"
 BOT_USERNAME=""
@@ -97,6 +97,7 @@ Options:
   --no-swap            Never create a swap file
   --no-zram            Don't set up compressed swap in RAM (zram)
   --no-earlyoom        Don't install earlyoom (kills the right process before the server thrashes)
+  --no-tune            Don't apply the low-RAM kernel/disk tuning (small write-back cache) or cap the journal size
   --no-quickjs         Don't install the QuickJS JS runtime (YouTube needs one: QuickJS, Deno, Node or Bun)
   --no-systemd         Don't install systemd units
   --skip-token-check   Don't validate the bot token against api.telegram.org
@@ -134,6 +135,7 @@ while [[ $# -gt 0 ]]; do
     --no-swap)     DO_SWAP=0; shift ;;
     --no-zram)     DO_ZRAM=0; shift ;;
     --no-earlyoom) DO_EARLYOOM=0; shift ;;
+    --no-tune)     DO_TUNE=0; shift ;;
     --no-quickjs|--no-deno) DO_JS=0; shift ;;
     --no-systemd)  DO_SYSTEMD=0; shift ;;
     --skip-token-check) DO_TOKEN_CHECK=0; shift ;;
@@ -184,7 +186,8 @@ do_uninstall() {
     systemctl disable --now leechbot.service leechbot-ytdlp-update.timer >>"$LOG" 2>&1 || true
   fi
   rm -f "$UNIT_DIR/leechbot.service" "$UNIT_DIR/leechbot-ytdlp-update.service" \
-        "$UNIT_DIR/leechbot-ytdlp-update.timer" "$BIN_DIR/leechbot"
+        "$UNIT_DIR/leechbot-ytdlp-update.timer" "$BIN_DIR/leechbot" \
+        /etc/sysctl.d/98-leechbot-io.conf /etc/systemd/journald.conf.d/leechbot.conf
   have_systemd && systemctl daemon-reload || true
   ok "Service and timer removed"
 
@@ -612,6 +615,36 @@ setup_earlyoom() {
   info "(the bot's yt-dlp/ffmpeg children are marked as first to be killed; the bot itself is protected)"
 }
 
+tune_system() {
+  step "Low-RAM tuning"
+  if (( ! DO_TUNE )); then info "Skipped (--no-tune)"; return 0; fi
+  # 1. A big download otherwise piles up gigabytes of unwritten ("dirty") pages in RAM before the kernel flushes them.
+  #    A small write-back window keeps them to a few dozen MB; the bot also drops its own cache while it works.
+  if (( MEM_MB < 3072 )); then
+    printf 'vm.dirty_background_bytes=16777216\nvm.dirty_bytes=67108864\nvm.vfs_cache_pressure=200\n' \
+      > /etc/sysctl.d/98-leechbot-io.conf
+    if run_try sysctl -q -p /etc/sysctl.d/98-leechbot-io.conf; then
+      ok "Small write-back cache (16 MB / 64 MB dirty limits) and eager dentry/inode cache reclaim"
+    else
+      warn "Couldn't apply the kernel settings (containers often forbid it); skipping."
+    fi
+  else
+    ok "${MEM_MB} MB RAM is plenty; kernel settings left alone"
+  fi
+  # 2. The journal can grow to gigabytes on a small disk. Cap it.
+  if have_systemd; then
+    mkdir -p /etc/systemd/journald.conf.d
+    printf '[Journal]\nSystemMaxUse=50M\nRuntimeMaxUse=30M\n' > /etc/systemd/journald.conf.d/leechbot.conf
+    run_try systemctl restart systemd-journald && ok "Journal capped at 50 MB" || warn "Couldn't restart journald; the cap applies after a reboot."
+  fi
+  # 3. Package downloads are no longer needed once installed.
+  case "$PM" in
+    apt) run_try apt-get clean || true ;;
+    *)   run_try "$PM" clean all || true ;;
+  esac
+  ok "Package cache cleared"
+}
+
 detect_owner_id() {
   step "Linking your Telegram account"
   command -v python3 >/dev/null 2>&1 || die "python3 is required to detect your Telegram ID (or pass --owner-id)."
@@ -826,6 +859,7 @@ main() {
   setup_swap
   setup_zram
   setup_earlyoom
+  tune_system
   if (( DETECT_OWNER )); then detect_owner_id; fi
   chown -R "$SVC_USER":"$SVC_USER" "$INSTALL_DIR"
   if (( DO_SYSTEMD )); then
