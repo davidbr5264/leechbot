@@ -430,6 +430,9 @@ install_packages() {
         || warn "ffmpeg isn't in your repos (try enabling RPM Fusion/EPEL). Video merging and thumbnails need it." ;;
   esac
   ok "Packages installed"
+  if command -v ffmpeg >/dev/null 2>&1 && [[ "$(ffmpeg -hide_banner -encoders 2>/dev/null || true)" != *libmp3lame* ]]; then
+    warn "This ffmpeg has no MP3 encoder (libmp3lame): audio downloads will fail. Install a full ffmpeg (RPM Fusion on Fedora/RHEL)."
+  fi
 
   PY="$(command -v python3)" || die "python3 not found after install."
   "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
